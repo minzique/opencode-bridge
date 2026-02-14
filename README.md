@@ -1,151 +1,208 @@
 # opencode-bridge
 
-MCP server that lets AI agents in [OpenCode](https://opencode.ai) talk to other OpenCode instances — locally or over the network.
+An MCP server that enables AI agents running on different machines to communicate with each other through HTTP relay.
 
-```
-┌──────────────────┐       ┌──────────────────┐
-│  OpenCode A      │ stdio │  MCP Bridge      │  HTTP   ┌──────────────┐
-│  (your session)  │◄─────►│  Server          │────────►│ OpenCode B   │
-│                  │       │                  │         │ (remote)     │
-└──────────────────┘       └──────────────────┘         └──────────────┘
-```
+## What It Does
 
-## What it does
+`opencode-bridge` acts as a bridge between OpenCode instances running on separate machines. It provides three MCP tools that allow agents to:
 
-Three MCP tools exposed to your agent:
+- **Ask questions** to remote agents and get responses
+- **List available agents** with their online/offline status
+- **Relay code** through a shared git remote for cross-machine collaboration
 
-| Tool | Description |
-|------|-------------|
-| `ask_agent` | Send a prompt to a named remote agent and get the response back. Supports session continuity. |
-| `list_agents` | Health-check all registered agents (ONLINE/OFFLINE + version). |
-| `relay_code` | Git push/pull through a shared remote for relaying code between machines. |
+## Architecture
+
+The bridge consists of:
+
+1. **Agent Registry** (`agents.json`) — Maps agent names to their OpenCode HTTP endpoints
+2. **Session Store** (`.sessions.json`) — Tracks active conversation sessions per agent
+3. **OpenCode Client** — HTTP client for the OpenCode REST API (`/session`, `/message`, `/health`)
+4. **Three MCP Tools**:
+   - `ask_agent` — Send prompts to remote agents, maintain conversation continuity
+   - `list_agents` — Check agent availability and session status
+   - `relay_code` — Push/pull code via git remote for file sharing between machines
+
+When you call `ask_agent`, the bridge:
+1. Looks up the agent's URL in the registry
+2. Reuses an existing session or creates a new one
+3. Sends the prompt via HTTP POST to the remote OpenCode instance
+4. Returns the agent's response and session ID for follow-up questions
 
 ## Setup
 
-### 1. Install
+### Prerequisites
+
+- Node.js 18+ or Bun
+- OpenCode instances running on each machine you want to connect
+- Network access between machines (HTTP)
+
+### Installation
 
 ```bash
-git clone https://github.com/minzique/opencode-bridge.git
 cd opencode-bridge
-bun install
+bun install  # or npm install
 ```
 
-### 2. Configure agents
+### Configuration
 
-Edit `agents.json` to point at your OpenCode instances:
+Create `agents.json` in the project root:
 
 ```json
 {
   "agents": {
     "mac-mini": {
       "url": "http://minzis-mac-mini.local:4096",
-      "description": "Remote Mac Mini agent"
+      "description": "Remote Mac Mini agent — Google Gemini, general purpose",
+      "username": "opencode",
+      "password": "optional-password"
     },
-    "gpu-box": {
-      "url": "http://10.0.0.5:4096",
-      "password": "secret",
-      "description": "GPU server for heavy tasks"
+    "workstation": {
+      "url": "http://192.168.1.100:4096",
+      "description": "Linux workstation with GPU"
     }
   }
 }
 ```
 
-### 3. Start remote OpenCode servers
+**Required fields:**
+- `url` — Full HTTP URL to the OpenCode instance (including port)
 
-On each remote machine:
+**Optional fields:**
+- `description` — Human-readable description
+- `username` — HTTP Basic Auth username (defaults to "opencode")
+- `password` — HTTP Basic Auth password
+
+### Running the Server
 
 ```bash
-opencode serve --port 4096 --hostname 0.0.0.0
+bun run dev
 ```
 
-Add `--mdns` for automatic LAN discovery. Set `OPENCODE_SERVER_PASSWORD` for auth.
+The MCP server runs on stdio and can be integrated into any MCP-compatible client.
 
-### 4. Register with OpenCode
+### Environment Variables
 
-Add to `~/.config/opencode/opencode.json`:
-
-```json
-{
-  "mcp": {
-    "bridge": {
-      "type": "local",
-      "command": ["bun", "run", "/path/to/opencode-bridge/src/index.ts"],
-      "enabled": true,
-      "environment": {
-        "BRIDGE_CONFIG": "/path/to/opencode-bridge/agents.json"
-      }
-    }
-  }
-}
-```
-
-Verify: `opencode mcp ls` should show `bridge` as connected.
+- `BRIDGE_CONFIG` — Path to `agents.json` (default: `./agents.json`)
+- `BRIDGE_SESSION_STORE` — Path to session store (default: `./.sessions.json`)
+- `BRIDGE_GIT_CWD` — Working directory for `relay_code` git operations (default: current directory)
 
 ## Usage
 
-Once registered, your agent can use the tools directly:
+### Ask a Remote Agent
 
+```typescript
+// First question (creates new session)
+ask_agent({
+  agent: "mac-mini",
+  prompt: "What's the weather in Tokyo?"
+})
+
+// Follow-up question (reuses session)
+ask_agent({
+  agent: "mac-mini",
+  prompt: "What about tomorrow?"
+})
+
+// Force new session
+ask_agent({
+  agent: "mac-mini",
+  prompt: "New topic: explain quantum computing",
+  new_session: true
+})
 ```
-> Use ask_agent to ask mac-mini for its hostname
 
+**Returns:**
+```json
 {
   "agent": "mac-mini",
-  "session_id": "ses_abc123",
-  "response": "Minzis-Mac-mini.local"
-}
-
-> Follow up on that same session — what OS is it running?
-
-{
-  "agent": "mac-mini",
-  "session_id": "ses_abc123",
-  "response": "macOS 15.3 (Sequoia)"
+  "session_id": "ses_abc123...",
+  "response": "The weather in Tokyo is..."
 }
 ```
 
-Session IDs are persisted to `.sessions.json` — conversations survive MCP server restarts.
+### List Available Agents
 
-## Tool reference
+```typescript
+list_agents()
+```
 
-### ask_agent
+**Returns:**
+```
+mac-mini: ONLINE (v1.2.3) @ http://minzis-mac-mini.local:4096 — Remote Mac Mini agent
+  session: ses_abc123...
 
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `agent` | string | yes | Agent name from `agents.json` |
-| `prompt` | string | yes | The prompt to send |
-| `session_id` | string | no | Continue an existing conversation |
-| `new_session` | boolean | no | Force a new session |
+workstation: OFFLINE @ http://192.168.1.100:4096 — Linux workstation with GPU
+  no active session
+```
 
-### list_agents
+### Relay Code Between Machines
 
-No parameters. Returns status of all configured agents.
+```typescript
+// Push local changes to relay remote
+relay_code({
+  direction: "push",
+  message: "Add new feature",
+  remote: "relay",
+  branch: "main"
+})
 
-### relay_code
+// Pull changes from relay remote
+relay_code({
+  direction: "pull",
+  remote: "relay",
+  branch: "main"
+})
+```
 
-| Parameter | Type | Required | Description |
-|-----------|------|----------|-------------|
-| `direction` | `"push"` \| `"pull"` | yes | Push local or pull remote changes |
-| `remote` | string | no | Git remote name (default: `"relay"`) |
-| `branch` | string | no | Git branch (default: `"main"`) |
-| `message` | string | no | Commit message for push |
-| `cwd` | string | no | Working directory |
+**Use case:** Agent A on machine 1 writes code, pushes to shared git remote. Agent B on machine 2 pulls the code and continues work.
 
-## How it works
+## How Sessions Work
 
-OpenCode already has a client-server architecture — the TUI is just a client talking to an HTTP server. `opencode serve` exposes this as a headless API. This bridge is an MCP server that:
+- Each agent maintains one active session at a time (stored in `.sessions.json`)
+- Sessions persist across bridge restarts
+- If a session becomes invalid (404), it's automatically cleared
+- Use `new_session: true` to start fresh conversations
 
-1. Receives tool calls from your OpenCode agent via stdio
-2. Translates them to HTTP requests against remote OpenCode servers
-3. Returns responses back through MCP
+## Development
 
-The OpenCode REST API handles sessions, messages, tool execution, and streaming. The bridge just routes between instances.
+```bash
+# Run tests
+bun test
 
-## Requirements
+# Type checking
+bun run tsc --noEmit
+```
 
-- [Bun](https://bun.sh) 1.0+
-- [OpenCode](https://opencode.ai) 1.2+ on both local and remote machines
-- Network connectivity between machines (LAN or VPN)
+## Project Structure
 
-## License
+```
+opencode-bridge/
+├── src/
+│   ├── index.ts              # MCP server entry point
+│   ├── registry.ts           # Agent registry loader
+│   ├── session-store.ts      # Session persistence
+│   ├── opencode-client.ts    # HTTP client for OpenCode API
+│   └── tools/
+│       ├── ask-agent.ts      # ask_agent tool
+│       ├── list-agents.ts    # list_agents tool
+│       └── relay-code.ts     # relay_code tool
+├── agents.json               # Agent registry (user-created)
+├── .sessions.json            # Session store (auto-generated)
+└── package.json
+```
 
-MIT
+## Troubleshooting
+
+**Agent shows OFFLINE:**
+- Check that the OpenCode instance is running on the target machine
+- Verify network connectivity: `curl http://target-url:4096/global/health`
+- Check firewall rules
+
+**Session errors (404):**
+- Session may have expired on the remote instance
+- Use `new_session: true` to create a fresh session
+
+**relay_code fails:**
+- Ensure git remote is configured: `git remote -v`
+- Check that you have push/pull permissions
+- Verify the working directory with `cwd` parameter
