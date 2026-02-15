@@ -2,7 +2,7 @@
   "agents": {
     "mac-mini": {
       "url": "http://minzis-mac-mini.local:4096",
-      "description": "Remote Mac Mini agent — Google Gemini, general purpose"
+      "description": "Mac Mini — runs memory service, always-on"
     }
   }
 }
